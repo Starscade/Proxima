@@ -1,0 +1,5 @@
+.POSIX:
+
+all:
+
+	@./install.sh
