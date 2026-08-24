@@ -107,7 +107,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := client.Do(proxyRequest)
 	if err != nil {
 		log.Printf("Proxy error for %s: %v", r.Host, err)
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		w.WriteHeader(http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
