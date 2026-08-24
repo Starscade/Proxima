@@ -10,10 +10,10 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"log"
 	"math/big"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
@@ -22,82 +22,106 @@ import (
 	"time"
 )
 
-type Override struct {
+type Route struct {
 	Source      string `json:"source"`
 	Destination string `json:"destination"`
 }
 
 type Config struct {
-	Log struct {
-		Level string `json:"level"`
-	} `json:"log"`
 	Router struct {
-		DefaultDestination string     `json:"default_destination"`
-		Overrides          []Override `json:"overrides"`
-	} `json:"router"`
+		DefaultUpstreamOrigin string
+		Routes                []Route
+	}
 	TLS struct {
-		PemFile string   `json:"pem_file"`
-		Domains []string `json:"domains"`
-	} `json:"tls"`
+		PemFile string
+		Domains []string
+	}
 }
 
 type ProxyHandler struct {
-	routes       map[string]*url.URL
 	defaultProxy *url.URL
-	proxy        *httputil.ReverseProxy
+	routes       map[string]*url.URL
 }
 
 func NewProxyHandler(cfg Config) *ProxyHandler {
-	routes := make(map[string]*url.URL)
-	for _, ovr := range cfg.Router.Overrides {
-		u, err := url.Parse(ovr.Destination)
-		if err != nil {
-			log.Fatalf("Invalid destination URL %s: %v", ovr.Destination, err)
-		}
-		routes[ovr.Source] = u
-		log.Printf("Route configured: %s -> %s", ovr.Source, ovr.Destination)
-	}
-
-	defaultURL, err := url.Parse(cfg.Router.DefaultDestination)
+	defaultURL, err := url.Parse(cfg.Router.DefaultUpstreamOrigin)
 	if err != nil {
-		log.Fatalf("Invalid default destination URL %s: %v", cfg.Router.DefaultDestination, err)
+		log.Fatalf("Invalid default destination URL %s: %v", cfg.Router.DefaultUpstreamOrigin, err)
 	}
 
-	ph := &ProxyHandler{
-		routes:       routes,
-		defaultProxy: defaultURL,
-	}
-
-	// Use a single proxy instance for all requests
-	ph.proxy = httputil.NewSingleHostReverseProxy(defaultURL)
-	ph.proxy.Transport = &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-
-	// The Director is the "router". It modifies the request on the fly.
-	originalDirector := ph.proxy.Director
-	ph.proxy.Director = func(req *http.Request) {
-		target, ok := ph.routes[req.Host]
-		if !ok {
-			target = ph.defaultProxy
+	routesMap := make(map[string]*url.URL)
+	for _, r := range cfg.Router.Routes {
+		u, err := url.Parse(r.Destination)
+		if err != nil {
+			log.Printf("Warning: Invalid destination for %s: %v", r.Source, err)
+			continue
 		}
-
-		// Call original director for standard header setup
-		originalDirector(req)
-
-		// Override the destination based on the lookup
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-
-		// Preserve the incoming Host header for the target server
-		req.Host = req.Host
+		routesMap[r.Source] = u
 	}
 
-	return ph
+	return &ProxyHandler{
+		defaultProxy: defaultURL,
+		routes:       routesMap,
+	}
 }
 
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p.proxy.ServeHTTP(w, r)
+	target, ok := p.routes[r.Host]
+	if !ok {
+		target = p.defaultProxy
+	}
+
+	// Construct target URL preserving the original path and query
+	targetURL := *target
+	targetURL.Path = r.URL.Path
+	targetURL.RawQuery = r.URL.RawQuery
+
+	proxyRequest, err := http.NewRequest(r.Method, targetURL.String(), r.Body)
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	// Copy original headers to the proxy request
+	for name, values := range r.Header {
+		for _, value := range values {
+			proxyRequest.Header.Add(name, value)
+		}
+	}
+
+	if ok {
+		// Specific route: use destination host to satisfy Virtual Hosting/Port requirements
+		proxyRequest.Host = target.Host
+	} else {
+		// Default upstream: preserve original host so upstream can route internally
+		proxyRequest.Host = r.Host
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		Timeout: 30 * time.Second,
+	}
+
+	resp, err := client.Do(proxyRequest)
+	if err != nil {
+		log.Printf("Proxy error for %s: %v", r.Host, err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy response headers back to the client
+	for name, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	// Stream the response body back to the client
+	_, _ = io.Copy(w, resp.Body)
 }
 
 func generateCAAndCert(domains []string, combinedFile string) error {
@@ -167,49 +191,53 @@ func generateCAAndCert(domains []string, combinedFile string) error {
 }
 
 func main() {
-	cfgPath := os.Getenv("PROXIMA_CFG")
-	if cfgPath == "" {
-		cfgPath = "Proxima.json"
-	}
-
 	cfg := Config{}
-	file, err := os.Open(cfgPath)
-	if err != nil {
-		log.Printf("Config file %s not found or inaccessible, using defaults", cfgPath)
-	} else {
-		decoder := json.NewDecoder(file)
-		if err := decoder.Decode(&cfg); err != nil {
-			log.Printf("Failed to decode config JSON: %v, using defaults", err)
-		}
-		file.Close()
-	}
 
+	cfg.TLS.PemFile = os.Getenv("PROXIMA_PEM")
 	if cfg.TLS.PemFile == "" {
 		cfg.TLS.PemFile = "Proxima.pem"
 	}
 
-	if len(cfg.TLS.Domains) == 0 {
-		cfg.TLS.Domains = []string{"localhost"}
+	domainsEnv := os.Getenv("PROXIMA_DOMAINS")
+	if domainsEnv != "" {
+		cfg.TLS.Domains = strings.Split(domainsEnv, ",")
 	} else {
-		hasLocalhost := false
-		for _, d := range cfg.TLS.Domains {
-			if d == "localhost" {
-				hasLocalhost = true
-			}
+		cfg.TLS.Domains = []string{"localhost"}
+	}
+
+	cfg.Router.DefaultUpstreamOrigin = os.Getenv("PROXIMA_UPSTREAM_ORIGIN")
+	if cfg.Router.DefaultUpstreamOrigin == "" {
+		cfg.Router.DefaultUpstreamOrigin = "http://localhost:8080"
+	}
+
+	cfgFile := os.Getenv("PROXIMA_CFG")
+	if cfgFile != "" {
+		data, err := os.ReadFile(cfgFile)
+		if err != nil {
+			log.Fatalf("Failed to read config file %s: %v", cfgFile, err)
 		}
-		if !hasLocalhost {
-			cfg.TLS.Domains = append(cfg.TLS.Domains, "localhost")
+		if err := json.Unmarshal(data, &cfg.Router.Routes); err != nil {
+			log.Fatalf("Failed to parse routes JSON: %v", err)
+		}
+		for _, r := range cfg.Router.Routes {
+			log.Printf("Route override: %s -> %s", r.Source, r.Destination)
 		}
 	}
 
-	if cfg.Router.DefaultDestination == "" {
-		cfg.Router.DefaultDestination = "http://localhost:8080"
+	hasLocalhost := false
+	for _, d := range cfg.TLS.Domains {
+		if d == "localhost" {
+			hasLocalhost = true
+		}
+	}
+	if !hasLocalhost {
+		cfg.TLS.Domains = append(cfg.TLS.Domains, "localhost")
 	}
 
 	fullDomains := make([]string, 0)
 	for _, d := range cfg.TLS.Domains {
 		fullDomains = append(fullDomains, d)
-		if !strings.HasPrefix(d, "*.") {
+		if d != "localhost" && !strings.HasPrefix(d, "*.") {
 			fullDomains = append(fullDomains, "*."+d)
 		}
 	}
@@ -268,7 +296,7 @@ func main() {
 	}()
 
 	<-stop
-	log.Println("Terminating...")
+	log.Println("Terminating ...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -279,5 +307,5 @@ func main() {
 	if err := tlsServer.Shutdown(ctx); err != nil {
 		log.Printf("TLS shutdown error: %v", err)
 	}
-	log.Println("Server stopped")
+	log.Println("Server stopped.")
 }
