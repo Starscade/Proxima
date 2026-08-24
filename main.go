@@ -40,6 +40,7 @@ type Config struct {
 type ProxyHandler struct {
 	defaultProxy *url.URL
 	routes       map[string]*url.URL
+	httpClient   *http.Client
 }
 
 func NewProxyHandler(cfg Config) *ProxyHandler {
@@ -61,6 +62,14 @@ func NewProxyHandler(cfg Config) *ProxyHandler {
 	return &ProxyHandler{
 		defaultProxy: defaultURL,
 		routes:       routesMap,
+		httpClient: &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				MaxIdleConns:    100,
+				IdleConnTimeout: 90 * time.Second,
+			},
+			Timeout: 30 * time.Second,
+		},
 	}
 }
 
@@ -74,7 +83,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	targetURL.Path = r.URL.Path
 	targetURL.RawQuery = r.URL.RawQuery
 
-	proxyRequest, err := http.NewRequest(r.Method, targetURL.String(), r.Body)
+	proxyRequest, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL.String(), r.Body)
 	if err != nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
@@ -92,14 +101,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		proxyRequest.Host = r.Host
 	}
 
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-		Timeout: 30 * time.Second,
-	}
-
-	resp, err := client.Do(proxyRequest)
+	resp, err := p.httpClient.Do(proxyRequest)
 	if err != nil {
 		log.Printf("Proxy error for %s: %v", r.Host, err)
 		w.WriteHeader(http.StatusBadGateway)
@@ -113,7 +115,6 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-
 	_, _ = io.Copy(w, resp.Body)
 }
 
@@ -225,7 +226,7 @@ func main() {
 		cfg.TLS.Domains = append(cfg.TLS.Domains, "localhost")
 	}
 
-	fullDomains := make([]string, 0)
+	fullDomains := make([]string, 0, len(cfg.TLS.Domains)*2)
 	for _, d := range cfg.TLS.Domains {
 		fullDomains = append(fullDomains, d)
 		if !strings.HasPrefix(d, "*.") {
@@ -243,10 +244,7 @@ func main() {
 	handler := NewProxyHandler(cfg)
 
 	httpRedirect := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		target := "https://" + r.Host + r.URL.Path
-		if len(r.URL.RawQuery) > 0 {
-			target += "?" + r.URL.RawQuery
-		}
+		target := "https://" + r.Host + r.URL.RequestURI()
 		http.Redirect(w, r, target, http.StatusTemporaryRedirect)
 	})
 
