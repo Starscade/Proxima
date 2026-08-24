@@ -8,7 +8,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/json"
 	"encoding/pem"
 	"io"
 	"log"
@@ -23,8 +22,8 @@ import (
 )
 
 type Route struct {
-	Source      string `json:"source"`
-	Destination string `json:"destination"`
+	Source      string
+	Destination string
 }
 
 type Config struct {
@@ -71,7 +70,6 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		target = p.defaultProxy
 	}
 
-	// Construct target URL preserving the original path and query
 	targetURL := *target
 	targetURL.Path = r.URL.Path
 	targetURL.RawQuery = r.URL.RawQuery
@@ -82,7 +80,6 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Copy original headers to the proxy request
 	for name, values := range r.Header {
 		for _, value := range values {
 			proxyRequest.Header.Add(name, value)
@@ -90,10 +87,8 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if ok {
-		// Specific route: use destination host to satisfy Virtual Hosting/Port requirements
 		proxyRequest.Host = target.Host
 	} else {
-		// Default upstream: preserve original host so upstream can route internally
 		proxyRequest.Host = r.Host
 	}
 
@@ -112,7 +107,6 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// Copy response headers back to the client
 	for name, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(name, value)
@@ -120,7 +114,6 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 
-	// Stream the response body back to the client
 	_, _ = io.Copy(w, resp.Body)
 }
 
@@ -217,24 +210,8 @@ func main() {
 			kv := strings.SplitN(pair, "=", 2)
 			if len(kv) == 2 {
 				cfg.Router.Routes = append(cfg.Router.Routes, Route{Source: kv[0], Destination: kv[1]})
-				log.Printf("Route override (ENV): %s -> %s", kv[0], kv[1])
+				log.Printf("Route override: %s -> %s", kv[0], kv[1])
 			}
-		}
-	}
-
-	cfgFile := os.Getenv("PROXIMA_CFG")
-	if cfgFile != "" {
-		data, err := os.ReadFile(cfgFile)
-		if err != nil {
-			log.Fatalf("Failed to read config file %s: %v", cfgFile, err)
-		}
-		var fileRoutes []Route
-		if err := json.Unmarshal(data, &fileRoutes); err != nil {
-			log.Fatalf("Failed to parse routes JSON: %v", err)
-		}
-		cfg.Router.Routes = append(cfg.Router.Routes, fileRoutes...)
-		for _, r := range fileRoutes {
-			log.Printf("Route override (FILE): %s -> %s", r.Source, r.Destination)
 		}
 	}
 
