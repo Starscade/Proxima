@@ -229,7 +229,7 @@ func main() {
 	fullDomains := make([]string, 0, len(cfg.TLS.Domains)*2)
 	for _, d := range cfg.TLS.Domains {
 		fullDomains = append(fullDomains, d)
-		if !strings.HasPrefix(d, "*.") {
+		if d != "localhost" && !strings.HasPrefix(d, "*.") {
 			fullDomains = append(fullDomains, "*."+d)
 		}
 	}
