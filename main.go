@@ -210,17 +210,31 @@ func main() {
 		cfg.Router.DefaultUpstreamOrigin = "http://localhost:8080"
 	}
 
+	routesEnv := os.Getenv("PROXIMA_ROUTES")
+	if routesEnv != "" {
+		pairs := strings.Split(routesEnv, ",")
+		for _, pair := range pairs {
+			kv := strings.SplitN(pair, "=", 2)
+			if len(kv) == 2 {
+				cfg.Router.Routes = append(cfg.Router.Routes, Route{Source: kv[0], Destination: kv[1]})
+				log.Printf("Route override (ENV): %s -> %s", kv[0], kv[1])
+			}
+		}
+	}
+
 	cfgFile := os.Getenv("PROXIMA_CFG")
 	if cfgFile != "" {
 		data, err := os.ReadFile(cfgFile)
 		if err != nil {
 			log.Fatalf("Failed to read config file %s: %v", cfgFile, err)
 		}
-		if err := json.Unmarshal(data, &cfg.Router.Routes); err != nil {
+		var fileRoutes []Route
+		if err := json.Unmarshal(data, &fileRoutes); err != nil {
 			log.Fatalf("Failed to parse routes JSON: %v", err)
 		}
-		for _, r := range cfg.Router.Routes {
-			log.Printf("Route override: %s -> %s", r.Source, r.Destination)
+		cfg.Router.Routes = append(cfg.Router.Routes, fileRoutes...)
+		for _, r := range fileRoutes {
+			log.Printf("Route override (FILE): %s -> %s", r.Source, r.Destination)
 		}
 	}
 
