@@ -64,10 +64,9 @@ func NewProxyHandler(cfg Config) *ProxyHandler {
 		routes:       routesMap,
 		httpClient: &http.Client{
 			Transport: &http.Transport{
-				TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				MaxIdleConns:    100,
+				IdleConnTimeout: 90 * time.Second,
 			},
 			Timeout: 30 * time.Second,
 		},
@@ -96,8 +95,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Optimization: Always set Host header to the target destination to avoid 404s on virtual-hosted upstreams
-	proxyRequest.Host = target.Host
+	proxyRequest.Host = r.Host
 
 	resp, err := p.httpClient.Do(proxyRequest)
 	if err != nil {
